@@ -359,6 +359,73 @@ func TestCheckCDPInjector(t *testing.T) {
 	})
 }
 
+// TestCheckCookieDelivery covers the universal-cookie-delivery check's
+// three branches plus the source-only skip, using an injected keychain
+// probe so the test never touches the host Keychain.
+func TestCheckCookieDelivery(t *testing.T) {
+	okProbe := func() (int, error) { return 24, nil }
+	closedProbe := func() (int, error) { return 0, errors.New("not readable by this process") }
+
+	t.Run("source-only skipped", func(t *testing.T) {
+		c := checkCookieDeliveryWith(nil, okProbe)
+		if c.Severity != SeveritySkipped {
+			t.Fatalf("got %q, want SKIPPED", c.Severity)
+		}
+	})
+
+	t.Run("universal OK when profile written and key readable", func(t *testing.T) {
+		cfg := &config.SinkConfig{SkipChromeSQLite: false, Delivery: "universal"}
+		c := checkCookieDeliveryWith(cfg, okProbe)
+		if c.Severity != SeverityOK {
+			t.Fatalf("got %q (%q), want OK", c.Severity, c.Detail)
+		}
+		if !strings.Contains(c.Detail, "universal") {
+			t.Errorf("detail should mention universal: %q", c.Detail)
+		}
+	})
+
+	t.Run("universal OK without delivery marker still reads probe as truth", func(t *testing.T) {
+		cfg := &config.SinkConfig{SkipChromeSQLite: false} // Delivery unset
+		c := checkCookieDeliveryWith(cfg, okProbe)
+		if c.Severity != SeverityOK {
+			t.Fatalf("got %q (%q), want OK", c.Severity, c.Detail)
+		}
+		if !strings.Contains(c.Detail, "any unmodified cookie CLI works here") {
+			t.Errorf("detail: %q", c.Detail)
+		}
+	})
+
+	t.Run("degraded is INFO not a failure", func(t *testing.T) {
+		cfg := &config.SinkConfig{SkipChromeSQLite: true, Delivery: "degraded"}
+		// Probe should not even be consulted on the degraded branch, but
+		// pass a readable one to prove config drives this path.
+		c := checkCookieDeliveryWith(cfg, okProbe)
+		if c.Severity != SeverityInfo {
+			t.Fatalf("got %q (%q), want INFO", c.Severity, c.Detail)
+		}
+		if !strings.Contains(c.Detail, "degraded") {
+			t.Errorf("detail should mention degraded: %q", c.Detail)
+		}
+		if !strings.Contains(c.Remediation, "set-keychain-access --any-app") {
+			t.Errorf("remediation missing --any-app step: %q", c.Remediation)
+		}
+	})
+
+	t.Run("partial warns and names the --any-app step", func(t *testing.T) {
+		cfg := &config.SinkConfig{SkipChromeSQLite: false, Delivery: "universal"}
+		c := checkCookieDeliveryWith(cfg, closedProbe)
+		if c.Severity != SeverityWarn {
+			t.Fatalf("got %q (%q), want WARN", c.Severity, c.Detail)
+		}
+		if !strings.Contains(c.Detail, "partial") {
+			t.Errorf("detail should mention partial: %q", c.Detail)
+		}
+		if !strings.Contains(c.Remediation, "set-keychain-access --any-app") {
+			t.Errorf("remediation missing --any-app step: %q", c.Remediation)
+		}
+	})
+}
+
 // TestHostMatchesAnyAdapter covers the substring fallback used by the
 // adapter coverage check.
 func TestHostMatchesAnyAdapter(t *testing.T) {
@@ -416,8 +483,9 @@ peer:
 	// v0.13 added the Secrets bus check. DBSC resilience added the DBSC
 	// check (source role only; present here since this fixture is source).
 	// The consumption bridge added the Secret coverage + Binary install checks.
-	if got := len(report.Checks); got != 14 {
-		t.Fatalf("got %d checks, want 14", got)
+	// Universal cookie delivery added the Cookie delivery check.
+	if got := len(report.Checks); got != 15 {
+		t.Fatalf("got %d checks, want 15", got)
 	}
 
 	// Serialize the envelope and confirm it round-trips.
@@ -435,9 +503,10 @@ peer:
 
 	// Sink-only checks should be Skipped on a source-only install.
 	want := map[string]Severity{
-		"Sink listener": SeveritySkipped,
-		"Sink state":    SeveritySkipped,
-		"Sealing":       SeveritySkipped,
+		"Sink listener":   SeveritySkipped,
+		"Sink state":      SeveritySkipped,
+		"Sealing":         SeveritySkipped,
+		"Cookie delivery": SeveritySkipped,
 	}
 	for _, c := range report.Checks {
 		if w, ok := want[c.Name]; ok && c.Severity != w {

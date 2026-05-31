@@ -243,6 +243,19 @@ func buildReport(d doctorDeps) DoctorReport {
 	// the on-PATH copy and the daemon's copy don't silently differ.
 	checks = append(checks, checkBinaryInstall())
 
+	// 14. Cookie delivery (v0.13 universal cookie delivery) -- sink role
+	// only. Tells the operator whether ANY unmodified cookie CLI works on
+	// this box (universal) vs only agentcookie-aware tools (degraded).
+	if sinkCfg != nil {
+		checks = append(checks, checkCookieDelivery(sinkCfg))
+	} else {
+		checks = append(checks, Check{
+			Name:     "Cookie delivery",
+			Severity: SeveritySkipped,
+			Detail:   "source-only install",
+		})
+	}
+
 	exit := 0
 	for _, c := range checks {
 		if c.Severity == SeverityFail {
@@ -834,6 +847,80 @@ func checkCDPInjector(sinkCfg *config.SinkConfig) Check {
 		Severity:    SeverityWarn,
 		Detail:      "Chrome.app not found in /Applications or ~/Applications; CDP injection will fail at sync time",
 		Remediation: "install Google Chrome from https://www.google.com/chrome/, or pass --no-cdp at wizard install to disable CDP injection",
+	}
+}
+
+// checkCookieDelivery (v0.13 universal cookie delivery) reports whether
+// ANY unmodified cookie CLI works on this sink, or only agentcookie-aware
+// tools. Universal delivery requires two facts to both hold:
+//
+//	a. The real Default Chrome profile is written (skip_chrome_sqlite=false),
+//	   so a cookie CLI reading Chrome's default profile sees synced sessions.
+//	b. The Chrome Safe Storage key is readable by any local process (a
+//	   non-zero key length with no error from KeybaseKeychainProbe), so an
+//	   unmodified CLI can decrypt those cookies.
+//
+// sinkCfg.Delivery is the recorded intent ("universal" | "degraded"); it
+// phrases the message, but the live probe is the source of truth. The
+// exported check wires the real KeybaseKeychainProbe; checkCookieDeliveryWith
+// is the testable core over an injected probe.
+func checkCookieDelivery(sinkCfg *config.SinkConfig) Check {
+	return checkCookieDeliveryWith(sinkCfg, func() (int, error) {
+		return chrome.KeybaseKeychainProbe(3 * time.Second)
+	})
+}
+
+// checkCookieDeliveryWith is the testable core of checkCookieDelivery over an
+// injected keychain probe (so tests don't depend on the host Keychain). A
+// probe returning n>0 with no error means the Chrome Safe Storage key is
+// readable by any local process.
+func checkCookieDeliveryWith(sinkCfg *config.SinkConfig, probe func() (int, error)) Check {
+	if sinkCfg == nil {
+		return Check{
+			Name:     "Cookie delivery",
+			Severity: SeveritySkipped,
+			Detail:   "source-only install",
+		}
+	}
+
+	realProfile := !sinkCfg.SkipChromeSQLite
+
+	// Degraded by configuration: the sink intentionally skips Chrome's real
+	// SQLite/Default profile. Only agentcookie-aware tools (sidecar/adapter
+	// readers) see synced cookies. INFO, not a failure -- this is a valid
+	// supported mode (headless / SSH-only Mac minis).
+	if !realProfile {
+		return Check{
+			Name:        "Cookie delivery",
+			Severity:    SeverityInfo,
+			Detail:      "degraded: writes a separate profile; only agentcookie-aware tools work",
+			Remediation: "run `agentcookie wizard set-keychain-access --any-app` and set delivery universal (skip_chrome_sqlite=false) for any unmodified cookie CLI to work here",
+		}
+	}
+
+	keyLen, err := probe()
+	keyReadable := err == nil && keyLen > 0
+
+	if keyReadable {
+		detail := "universal: real Default profile written and Chrome Safe Storage readable; any unmodified cookie CLI works here"
+		if sinkCfg.Delivery == "universal" {
+			detail = "universal (delivery=universal): real Default profile written and Chrome Safe Storage readable; any unmodified cookie CLI works here"
+		}
+		return Check{
+			Name:     "Cookie delivery",
+			Severity: SeverityOK,
+			Detail:   detail,
+		}
+	}
+
+	// Real profile is written but the key is not readable by other processes
+	// (universal intended, but the any-app keychain open never happened or
+	// failed). An unmodified CLI sees the cookies but can't decrypt them.
+	return Check{
+		Name:        "Cookie delivery",
+		Severity:    SeverityWarn,
+		Detail:      "partial: real Default profile written but Chrome Safe Storage key is not readable by other apps; unmodified cookie CLIs can't decrypt synced cookies",
+		Remediation: "run `agentcookie wizard set-keychain-access --any-app` to open the Chrome Safe Storage key to any local process",
 	}
 }
 
