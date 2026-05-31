@@ -80,7 +80,7 @@ var secretEnvCmd = &cobra.Command{
 }
 
 func init() {
-	secretCmd.AddCommand(secretListCmd, secretGetCmd, secretSetCmd, secretRmCmd, secretImportFromCmd, secretEnvCmd)
+	secretCmd.AddCommand(secretListCmd, secretGetCmd, secretSetCmd, secretRmCmd, secretImportFromCmd, secretEnvCmd, secretAliasCmd)
 	secretImportFromCmd.Flags().StringVar(&secretImportAs, "as", "", "cli-name to file the imported secrets under (required)")
 }
 
@@ -311,22 +311,22 @@ func importParse(path string, data []byte) (map[string]string, []string, error) 
 	// Common field-name heuristics observed in the U1 audit. Lowercase
 	// match; we render in canonical UPPER_SNAKE_CASE on the way out.
 	canonical := map[string]string{
-		"access_token":           "OAUTH_BEARER",
-		"accesstoken":            "OAUTH_BEARER",
-		"refresh_token":          "OAUTH_REFRESH",
-		"refreshtoken":           "OAUTH_REFRESH",
-		"api_key":                "API_KEY",
-		"apikey":                 "API_KEY",
-		"client_id":              "OAUTH_CLIENT_ID",
-		"clientid":               "OAUTH_CLIENT_ID",
-		"client_secret":          "OAUTH_CLIENT_SECRET",
-		"clientsecret":           "OAUTH_CLIENT_SECRET",
-		"token":                  "TOKEN",
-		"bearer":                 "OAUTH_BEARER",
-		"auth_header":            "AUTH_HEADER",
-		"token_expiry":           "OAUTH_EXPIRES_AT",
-		"expires_at":             "OAUTH_EXPIRES_AT",
-		"base_url":               "BASE_URL",
+		"access_token":  "OAUTH_BEARER",
+		"accesstoken":   "OAUTH_BEARER",
+		"refresh_token": "OAUTH_REFRESH",
+		"refreshtoken":  "OAUTH_REFRESH",
+		"api_key":       "API_KEY",
+		"apikey":        "API_KEY",
+		"client_id":     "OAUTH_CLIENT_ID",
+		"clientid":      "OAUTH_CLIENT_ID",
+		"client_secret": "OAUTH_CLIENT_SECRET",
+		"clientsecret":  "OAUTH_CLIENT_SECRET",
+		"token":         "TOKEN",
+		"bearer":        "OAUTH_BEARER",
+		"auth_header":   "AUTH_HEADER",
+		"token_expiry":  "OAUTH_EXPIRES_AT",
+		"expires_at":    "OAUTH_EXPIRES_AT",
+		"base_url":      "BASE_URL",
 	}
 
 	flat := map[string]string{}
@@ -600,6 +600,20 @@ func runSecretEnv(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("read %s: %w", plainPath, err)
 		}
 	}
+	// Apply aliases so the consumer's declared env var name (e.g.
+	// TESLA_AUTH_TOKEN) is emitted carrying the live value of the synced key
+	// it maps to (e.g. OAUTH_BEARER). Resolved on every call so it tracks
+	// token refreshes rather than going stale.
+	aliases, err := readAliases(cliName)
+	if err != nil {
+		return fmt.Errorf("read aliases: %w", err)
+	}
+	for declared, stored := range aliases {
+		if v, ok := kv[stored]; ok {
+			kv[declared] = v
+		}
+	}
+
 	keys := make([]string, 0, len(kv))
 	for k := range kv {
 		keys = append(keys, k)
@@ -608,6 +622,83 @@ func runSecretEnv(cmd *cobra.Command, args []string) error {
 	for _, k := range keys {
 		fmt.Fprintf(cmd.OutOrStdout(), "%s=%s\n", k, kv[k])
 	}
+	return nil
+}
+
+// aliasesPath is the per-CLI alias file mapping a consumer's declared env var
+// name to the synced secret key that holds its value.
+func aliasesPath(cliName string) string {
+	return filepath.Join(secretsRoot(), cliName, "aliases.env")
+}
+
+// readAliases loads declared-env-var -> stored-key mappings for a CLI. A
+// missing file is not an error (most CLIs need no alias).
+func readAliases(cliName string) (map[string]string, error) {
+	m, err := readEnvAll(aliasesPath(cliName))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return map[string]string{}, nil
+		}
+		return nil, err
+	}
+	return m, nil
+}
+
+var secretAliasCmd = &cobra.Command{
+	Use:   "alias <cli-name> [<declared-env-var> <stored-key>]",
+	Short: "Map a consumer's declared env var to a synced secret key (resolved live by `secret env`)",
+	Long: `alias bridges a CLI's expected auth env var name to the key the secrets
+bus actually stores, so 'agentcookie secret env' emits the name the CLI reads.
+
+  agentcookie secret alias tesla-pp-cli TESLA_AUTH_TOKEN OAUTH_BEARER
+  agentcookie secret alias tesla-pp-cli        # list current aliases
+
+The alias is resolved against the live synced value on every 'secret env',
+so it tracks token refreshes instead of going stale. Use it when a CLI reads
+a different env var name than the one the secret was imported under.`,
+	Args: cobra.RangeArgs(1, 3),
+	RunE: runSecretAlias,
+}
+
+func runSecretAlias(cmd *cobra.Command, args []string) error {
+	cliName := args[0]
+	if !validBusName(cliName) {
+		return fmt.Errorf("invalid cli-name %q", cliName)
+	}
+	if len(args) == 1 {
+		aliases, err := readAliases(cliName)
+		if err != nil {
+			return err
+		}
+		declaredKeys := make([]string, 0, len(aliases))
+		for d := range aliases {
+			declaredKeys = append(declaredKeys, d)
+		}
+		sort.Strings(declaredKeys)
+		for _, d := range declaredKeys {
+			fmt.Fprintf(cmd.OutOrStdout(), "%s <- %s\n", d, aliases[d])
+		}
+		return nil
+	}
+	if len(args) != 3 {
+		return fmt.Errorf("to set an alias pass <cli-name> <declared-env-var> <stored-key>; to list pass just <cli-name>")
+	}
+	declared, stored := args[1], args[2]
+	if !validBusKey(declared) || !validBusKey(stored) {
+		return fmt.Errorf("env var names must be valid identifiers (A-Z, 0-9, underscore)")
+	}
+	aliases, err := readAliases(cliName)
+	if err != nil {
+		return err
+	}
+	aliases[declared] = stored
+	if err := os.MkdirAll(filepath.Dir(aliasesPath(cliName)), 0o700); err != nil {
+		return fmt.Errorf("mkdir secrets dir: %w", err)
+	}
+	if err := writeEnvAtomic(aliasesPath(cliName), aliases); err != nil {
+		return fmt.Errorf("write aliases: %w", err)
+	}
+	fmt.Fprintf(cmd.OutOrStdout(), "aliased %s <- %s for %s\n", declared, stored, cliName)
 	return nil
 }
 
