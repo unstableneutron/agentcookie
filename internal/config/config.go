@@ -24,6 +24,11 @@ type SourceConfig struct {
 	Browser  BrowserRef  `yaml:"browser,omitempty" json:"browser,omitempty"`
 	Peer     PeerRef     `yaml:"peer,omitempty" json:"peer,omitempty"`
 	Security SecurityRef `yaml:"security,omitempty" json:"security,omitempty"`
+	// Cmux configures the same-machine local loop: `agentcookie cmux-sync`
+	// reads this machine's Chrome and injects into this machine's cmux
+	// browser. Independent of the sink/peer push path; absent = loop off.
+	// Reuses the CmuxRef shape (see SinkConfig.Cmux).
+	Cmux CmuxRef `yaml:"cmux,omitempty" json:"cmux,omitempty"`
 }
 
 // SinkConfig captures the sink machine's settings.
@@ -51,7 +56,36 @@ type SinkConfig struct {
 	Security         SecurityRef `yaml:"security,omitempty" json:"security,omitempty"`
 	SkipChromeSQLite bool        `yaml:"skip_chrome_sqlite,omitempty" json:"skip_chrome_sqlite,omitempty"`
 	CDP              CDPRef      `yaml:"cdp,omitempty" json:"cdp,omitempty"`
+	Cmux             CmuxRef     `yaml:"cmux,omitempty" json:"cmux,omitempty"`
 	Delivery         string      `yaml:"delivery,omitempty" json:"delivery,omitempty"`
+}
+
+// CmuxRef configures the cmux cookie-delivery surface (a fourth surface
+// alongside Chrome SQLite, the sidecar, and the per-CLI adapters). When
+// Enabled, the sink injects the synced cookies into cmux's embedded
+// WebKit browser after each /sync via `cmux rpc browser.cookies.set`, so
+// an agent driving cmux's browser wakes up authenticated. cmux holds its
+// own WebKit cookie jar (separate from Chrome's SQLite), so this surface
+// is purely additive.
+//
+// omitempty keeps a pre-cmux sink.yaml valid with the surface off: an
+// absent block decodes to Enabled=false and the sink never touches cmux.
+//
+// NOTE: cmux's RPC socket defaults to socketControlMode "cmuxOnly", which
+// rejects this sink (a LaunchAgent, not a cmux child). `agentcookie
+// doctor` detects that and prints the one-line remediation
+// (socketControlMode allowAll/password in ~/.config/cmux/cmux.json, then
+// a full cmux restart -- the mode is read only at app launch).
+type CmuxRef struct {
+	Enabled bool `yaml:"enabled" json:"enabled"`
+	// CmuxPath overrides the cmux CLI location. Empty uses the
+	// canonical app-bundle path with a PATH fallback (see
+	// internal/sinkpush.NewCmux).
+	CmuxPath string `yaml:"cmux_path,omitempty" json:"cmux_path,omitempty"`
+	// DomainFilter narrows which cookies reach cmux, as SQLite-LIKE
+	// host_key patterns (e.g. "%github.com"). Empty means deliver the
+	// full synced set (after the sink's blocklist filter).
+	DomainFilter []string `yaml:"domain_filter,omitempty" json:"domain_filter,omitempty"`
 }
 
 // CDPRef configures the v0.12.0-beta.3 CDP-injection mode. When Enabled,
@@ -122,7 +156,6 @@ func LoadSource(dir string) (*SourceConfig, error) {
 	if err := loadYAML(path, &cfg); err != nil {
 		return nil, err
 	}
-	cfg.Chrome.DBPath = ExpandTilde(cfg.Chrome.DBPath)
 	if cfg.Sink.URL == "" {
 		return nil, fmt.Errorf("%s: sink.url is required", path)
 	}
@@ -132,23 +165,57 @@ func LoadSource(dir string) (*SourceConfig, error) {
 	if err := validateSharedSecret(path, cfg.Security.SharedSecret); err != nil {
 		return nil, err
 	}
+	if err := resolveSourcePaths(path, &cfg); err != nil {
+		return nil, err
+	}
+	return &cfg, nil
+}
+
+// LoadSourceLocal loads source.yaml for local-only consumers like
+// `cmux-sync`, which read Chrome and act on this machine alone. Unlike
+// LoadSource it does NOT require sink.url or a peer/secret -- the local
+// loop has no push target, so demanding push config would break the
+// documented "no sink, no peer" use case. A missing source.yaml is fine:
+// it yields defaults (default Chrome path, no blocklist, cmux off).
+func LoadSourceLocal(dir string) (*SourceConfig, error) {
+	path := filepath.Join(dir, "source.yaml")
+	var cfg SourceConfig
+	if _, statErr := os.Stat(path); statErr == nil {
+		if err := loadYAML(path, &cfg); err != nil {
+			return nil, err
+		}
+	}
+	if err := resolveSourcePaths(path, &cfg); err != nil {
+		return nil, err
+	}
+	return &cfg, nil
+}
+
+// resolveSourcePaths applies the browser/Chrome-path/cmux-path resolution
+// shared by LoadSource and LoadSourceLocal (everything except the
+// push-only sink/peer/secret validation).
+func resolveSourcePaths(path string, cfg *SourceConfig) error {
+	cfg.Chrome.DBPath = ExpandTilde(cfg.Chrome.DBPath)
 	if cfg.Browser.Name != "" {
 		if _, err := lookupSourceBrowserPath(cfg.Browser.Name); err != nil {
-			return nil, fmt.Errorf("%s: %w", path, err)
+			return fmt.Errorf("%s: %w", path, err)
 		}
 	}
 	if cfg.Chrome.DBPath == "" {
 		if cfg.Browser.Name != "" || cfg.Browser.Profile != "" {
 			dbPath, err := SourceBrowserCookiesPath(cfg.Browser.Name, cfg.Browser.Profile)
 			if err != nil {
-				return nil, fmt.Errorf("%s: %w", path, err)
+				return fmt.Errorf("%s: %w", path, err)
 			}
 			cfg.Chrome.DBPath = dbPath
 		} else {
 			cfg.Chrome.DBPath = DefaultChromeCookiesPath()
 		}
 	}
-	return &cfg, nil
+	if cfg.Cmux.CmuxPath != "" {
+		cfg.Cmux.CmuxPath = ExpandTilde(cfg.Cmux.CmuxPath)
+	}
+	return nil
 }
 
 // LoadSink reads sink.yaml from dir.
@@ -176,6 +243,9 @@ func LoadSink(dir string) (*SinkConfig, error) {
 	}
 	if cfg.Chrome.DBPath == "" {
 		cfg.Chrome.DBPath = DefaultChromeCookiesPath()
+	}
+	if cfg.Cmux.CmuxPath != "" {
+		cfg.Cmux.CmuxPath = ExpandTilde(cfg.Cmux.CmuxPath)
 	}
 	return &cfg, nil
 }

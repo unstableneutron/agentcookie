@@ -245,6 +245,32 @@ func buildReport(d doctorDeps) DoctorReport {
 		})
 	}
 
+	// 10b. cmux delivery (sink surface) -- verifies the opt-in cmux sink
+	// surface can reach cmux, and specifically that socketControlMode is
+	// not the default "cmuxOnly" that would reject the LaunchAgent sink.
+	if sinkCfg != nil {
+		checks = append(checks, checkCmuxDelivery(sinkCfg.Cmux, "cmux delivery"))
+	} else {
+		checks = append(checks, Check{
+			Name:     "cmux delivery",
+			Severity: SeveritySkipped,
+			Detail:   "source-only install",
+		})
+	}
+
+	// 10c. cmux local loop (source side) -- verifies `cmux-sync` can reach
+	// cmux when the local loop is configured in source.yaml. Same gate as
+	// the sink surface, surfaced from the machine that runs the loop.
+	if srcCfg != nil {
+		checks = append(checks, checkCmuxDelivery(srcCfg.Cmux, "cmux local loop"))
+	} else {
+		checks = append(checks, Check{
+			Name:     "cmux local loop",
+			Severity: SeveritySkipped,
+			Detail:   "sink-only install",
+		})
+	}
+
 	// 11. Secrets bus (v0.13). Reports how many CLIs are registered,
 	// total key count, sealed-vs-plaintext mode, sync freshness.
 	// Reads from the secrets root on whichever machine is running
@@ -924,6 +950,80 @@ func hostMatchesAnyAdapter(hostKey string, adapters []sinkpush.Adapter) bool {
 // usable: cdp.profile_dir exists and is writable, AND Chrome.app is
 // installed on this Mac. WARN when configured but unusable; SKIPPED
 // when cdp.enabled is false.
+// checkCmuxDelivery reports whether an opt-in cmux cookie-delivery path
+// can actually reach cmux. Used for both the sink surface and the
+// source-side local loop (`cmux-sync`); the label distinguishes them.
+// The headline failure it catches: a non-cmux-child caller (the sink
+// LaunchAgent, or a launchd-run local loop) is rejected by cmux's
+// default socketControlMode "cmuxOnly", so cookies silently never land.
+// WARN (not FAIL) and always non-fatal.
+func checkCmuxDelivery(cmux config.CmuxRef, label string) Check {
+	return checkCmuxDeliveryWith(cmux, label, probeCmuxAccessMode)
+}
+
+func checkCmuxDeliveryWith(cmux config.CmuxRef, label string, probe func(binary string) (string, error)) Check {
+	if !cmux.Enabled {
+		return Check{
+			Name:     label,
+			Severity: SeveritySkipped,
+			Detail:   "cmux.enabled is false",
+		}
+	}
+	binary := sinkpush.ResolveCmuxBinary(cmux.CmuxPath)
+	if info, err := os.Stat(binary); err != nil || info.IsDir() {
+		return Check{
+			Name:        label,
+			Severity:    SeverityWarn,
+			Detail:      "cmux.enabled but the cmux CLI was not found at " + binary,
+			Remediation: "install cmux (https://cmux.com), or set cmux.cmux_path in your config to the CLI location",
+		}
+	}
+	mode, err := probe(binary)
+	if err != nil {
+		return Check{
+			Name:        label,
+			Severity:    SeverityWarn,
+			Detail:      "cmux is installed but its control socket did not answer (is cmux running?): " + err.Error(),
+			Remediation: "start cmux; if it is already running, its socketControlMode may be blocking a non-cmux-child caller -- set automation.socketControlMode to allowAll (or password) in ~/.config/cmux/cmux.json and fully restart cmux",
+		}
+	}
+	if mode == "cmuxOnly" {
+		return Check{
+			Name:        label,
+			Severity:    SeverityWarn,
+			Detail:      "cmux socketControlMode is \"cmuxOnly\", which rejects a non-cmux-child caller (a LaunchAgent or launchd-run loop); cookies will not be delivered unless the caller runs inside cmux",
+			Remediation: "run from inside cmux, OR set automation.socketControlMode to allowAll (or password) in ~/.config/cmux/cmux.json and FULLY restart cmux -- the mode is read only at app launch; `cmux reload-config` does not apply it",
+		}
+	}
+	return Check{
+		Name:     label,
+		Severity: SeverityOK,
+		Detail:   "cmux installed, socketControlMode=" + mode + "; cookies can be injected",
+	}
+}
+
+// probeCmuxAccessMode runs `cmux capabilities` and returns the server's
+// access_mode (the effective socketControlMode). It reflects the running
+// cmux's configured mode regardless of the caller.
+func probeCmuxAccessMode(binary string) (string, error) {
+	out, err := exec.Command(binary, "capabilities").Output()
+	if err != nil {
+		detail := ""
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			detail = strings.TrimSpace(string(ee.Stderr))
+		}
+		return "", fmt.Errorf("%w (%s)", err, detail)
+	}
+	var caps struct {
+		AccessMode string `json:"access_mode"`
+	}
+	if err := json.Unmarshal(out, &caps); err != nil {
+		return "", fmt.Errorf("parse capabilities: %w", err)
+	}
+	return caps.AccessMode, nil
+}
+
 func checkCDPInjector(sinkCfg *config.SinkConfig) Check {
 	if !sinkCfg.CDP.Enabled {
 		return Check{

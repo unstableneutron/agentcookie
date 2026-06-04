@@ -2,6 +2,47 @@
 
 ## [Unreleased]
 
+### cmux local loop: `agentcookie cmux-sync`
+
+Same-machine loop so this Mac's Chrome logins flow into this Mac's cmux
+browser, with no sink, no peer, and no Tailscale hop. `cmux-sync --once`
+does one read+inject cycle; `--watch` re-injects on every Chrome cookie
+change (fsnotify, the same watcher `source --watch` uses). It reuses
+`source.yaml`'s Chrome path and blocklist plus the shared decrypt + DBSC
+read pipeline, and the cmux injection adapter from the sink surface.
+
+Configure under a `cmux:` block in `source.yaml` (same shape as the sink
+block); `--domain`, `--cmux-path`, `--browser` flags override. Run it from
+inside cmux and it passes the default `cmuxOnly` socket gate with no cmux
+change; the launchd path needs the socketControlMode change, which
+`agentcookie doctor` now reports for the source-side loop as well as the
+sink surface. Run the installed signed binary so reading Chrome's Safe
+Storage key does not prompt (the grant is per-binary; `go run` prompts).
+
+### cmux cookie-delivery surface (opt-in)
+
+A fourth sink delivery surface that injects the synced session into
+cmux's embedded WebKit browser after every sync via
+`cmux rpc browser.cookies.set`, so an agent driving cmux's browser pane
+wakes up authenticated. cmux holds its own WebKit cookie jar separate
+from Chrome's SQLite, so this is purely additive.
+
+Opt in with `cmux.enabled: true` in `sink.yaml` (optional `cmux_path`
+and `domain_filter`). Implemented as a `sinkpush.Adapter`, so it inherits
+blocklist/DBSC filtering, the non-fatal contract, and `wizard
+verify-adapters` visibility, and is registered at sink startup only when
+enabled. Cookie values pass through verbatim (no second App-Bound strip);
+domains keep their leading dot (WebKit accepts it, unlike CDP); the
+adapter opens and reuses one unfocused `about:blank` browser surface
+since `browser.cookies.set` requires a surface and injected cookies
+persist at the profile level.
+
+`agentcookie doctor` gains a "cmux delivery" check that detects the
+common gotcha: cmux's default `socketControlMode: cmuxOnly` rejects the
+LaunchAgent sink, and the fix (set `allowAll`/`password` in
+`~/.config/cmux/cmux.json` and fully restart cmux) is printed as the
+remediation. See the "cmux delivery" section in the README.
+
 ### v0.14.0-beta.1: secrets bus adoption standard
 
 A standard projects can adopt to opt into agentcookie sync. Layered on
