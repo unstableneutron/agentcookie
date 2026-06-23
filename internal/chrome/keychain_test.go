@@ -1,7 +1,9 @@
 package chrome
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"testing"
 )
@@ -27,6 +29,66 @@ func TestSafeStoragePasswordFor_SkipsCGOForUnsignedBinary(t *testing.T) {
 	SafeStoragePasswordFor(b) //nolint:errcheck
 	if keybaseCalled {
 		t.Error("safeStorageViaKeybaseRunner must not be called for unsigned binaries")
+	}
+}
+
+func TestSafeStoragePasswordFor_LockedKeychainShortCircuitsBeforeCLI(t *testing.T) {
+	// A locked login keychain must short-circuit to ErrKeychainLocked BEFORE the
+	// `security` CLI runs -- otherwise the CLI hangs on an unlock prompt until the
+	// timeout and the error gets misclassified as a missing grant (exit 0). The
+	// transient lock must let a --watch agent exit non-zero so launchd retries.
+	origCodesign, origKeybase, origLocked, origCLI := codesignRunner, safeStorageViaKeybaseRunner, keychainLockedCheck, securityCLIRead
+	t.Cleanup(func() {
+		codesignRunner, safeStorageViaKeybaseRunner, keychainLockedCheck, securityCLIRead = origCodesign, origKeybase, origLocked, origCLI
+	})
+
+	codesignRunner = func(string) (string, error) { return "code object is not signed at all", nil } // unsigned: skip CGO
+	keychainLockedCheck = func() (bool, error) { return true, nil }                                  // keychain is locked
+	cliCalled := false
+	securityCLIRead = func(_ context.Context, _, _ string) ([]byte, []byte, error) {
+		cliCalled = true
+		return nil, nil, nil
+	}
+
+	b, _ := LookupBrowser("")
+	_, err := SafeStoragePasswordFor(b)
+	if !errors.Is(err, ErrKeychainLocked) {
+		t.Errorf("locked keychain should return ErrKeychainLocked, got: %v", err)
+	}
+	if IsKeychainAccessError(err) {
+		t.Error("a locked keychain must not be classified as an access error (it should retry)")
+	}
+	if cliCalled {
+		t.Error("security CLI must not run when the keychain is locked (avoids hang/unlock-prompt storm)")
+	}
+}
+
+func TestSafeStoragePasswordFor_UnknownLockStateFallsThroughToCLI(t *testing.T) {
+	// When lock state is unknown (status error, or non-darwin/cgo build), do not
+	// short-circuit -- fall through to the CLI lane.
+	origCodesign, origKeybase, origLocked, origCLI := codesignRunner, safeStorageViaKeybaseRunner, keychainLockedCheck, securityCLIRead
+	t.Cleanup(func() {
+		codesignRunner, safeStorageViaKeybaseRunner, keychainLockedCheck, securityCLIRead = origCodesign, origKeybase, origLocked, origCLI
+	})
+
+	codesignRunner = func(string) (string, error) { return "code object is not signed at all", nil }
+	keychainLockedCheck = func() (bool, error) { return false, errors.New("status unavailable") }
+	cliCalled := false
+	securityCLIRead = func(_ context.Context, _, _ string) ([]byte, []byte, error) {
+		cliCalled = true
+		return []byte("pw\n"), nil, nil
+	}
+
+	b, _ := LookupBrowser("")
+	pw, err := SafeStoragePasswordFor(b)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if pw != "pw" {
+		t.Errorf("password = %q, want %q", pw, "pw")
+	}
+	if !cliCalled {
+		t.Error("unknown lock state should fall through to the security CLI")
 	}
 }
 
@@ -93,12 +155,16 @@ func TestIsKeychainAccessError(t *testing.T) {
 	}{
 		{"nil", nil, false},
 		{"generic error", errors.New("network timeout"), false},
-		{"did you grant access", errors.New("read Chrome Safe Storage from Keychain (did you grant access?): exit status 1"), true},
-		{"not yet in partition", errors.New("read Chrome Safe Storage from Keychain timed out after 10s; this binary is not yet in the Safe Storage partition."), true},
-		// Locked keychain (-25308) is transient, not a missing grant: launchd
-		// should retry, so this must NOT be classified as an access error.
-		{"keychain locked 25308 is not access error", errors.New("error -25308: User interaction is not allowed"), false},
-		{"keychain locked phrase is not access error", errors.New("interaction is not allowed"), false},
+		{"missing grant sentinel", fmt.Errorf("read Keychain (did you grant access?): %w", ErrKeychainNoGrant), true},
+		{"timeout sentinel", fmt.Errorf("read Keychain timed out: %w", ErrKeychainTimeout), true},
+		// Sentinel survives an extra wrap layer -- the boundary the old string
+		// match defeated: classification holds even after re-wrapping.
+		{"missing grant wrapped twice", fmt.Errorf("cmux-sync: %w", fmt.Errorf("read Keychain: %w", ErrKeychainNoGrant)), true},
+		// The PR #107 regression guard: a LOCKED error wrapped in the
+		// "did you grant access?" prose must NOT be classified as an access
+		// error -- it carries ErrKeychainLocked, so launchd should retry.
+		{"locked wrapped in grant prose is not access error", fmt.Errorf("read Keychain (did you grant access?): login keychain is locked: %w", ErrKeychainLocked), false},
+		{"raw locked string is not access error", errors.New("error -25308: User interaction is not allowed"), false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
