@@ -155,6 +155,35 @@ func InjectAllContexts(browserCtx context.Context, cookies []chrome.Cookie) (int
 	return n, firstErr
 }
 
+// InjectBrowserContexts injects cookies into the browser's default context and
+// every explicit browser context, regardless of whether a non-internal page is
+// currently open. This is the right primitive for daemonless pushes to an
+// already-running browser: a fresh browser may expose only chrome://newtab, but
+// its default cookie store still needs the import before the next navigation.
+func InjectBrowserContexts(browserCtx context.Context, cookies []chrome.Cookie) (int, error) {
+	explicit, err := explicitContextSet(browserCtx)
+	if err != nil {
+		return 0, fmt.Errorf("livecdp: list browser contexts: %w", err)
+	}
+	n := 0
+	var firstErr error
+	if err := injectIntoContext(browserCtx, "", false, cookies); err != nil {
+		firstErr = err
+	} else {
+		n++
+	}
+	for id := range explicit {
+		if err := injectIntoContext(browserCtx, id, true, cookies); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		n++
+	}
+	return n, firstErr
+}
+
 // injectableContexts returns the unique BrowserContextIDs that own at least
 // one injectable page target, plus the set of those that are EXPLICIT
 // (created via Target.createBrowserContext -- e.g. browser-use's own

@@ -1,0 +1,14 @@
+# Example targets.yaml. Copy to ~/.config/agentcookie/targets.yaml on the
+# machine where you log in interactively. These daemonless targets are used by
+# `agentcookie push`; older agentcookie binaries ignore this file.
+
+version: 1
+
+targets:
+  kernel-browser:
+    # Optional connector. If omitted, the destination is reached locally.
+    via: ssh://aircover1.ws
+    # Destinations to write. CDP endpoints are resolved on the remote machine
+    # when via is ssh://..., so this localhost belongs to aircover1.ws.
+    to:
+      - cdp://127.0.0.1:19222

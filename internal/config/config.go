@@ -31,6 +31,22 @@ type SourceConfig struct {
 	Cmux CmuxRef `yaml:"cmux,omitempty" json:"cmux,omitempty"`
 }
 
+// TargetsFile captures daemonless push targets from targets.yaml. It is kept
+// separate from source.yaml so older agentcookie binaries with strict config
+// decoding keep accepting the existing source/sink configuration.
+type TargetsFile struct {
+	Version int                  `yaml:"version" json:"version"`
+	Targets map[string]TargetRef `yaml:"targets" json:"targets"`
+}
+
+// TargetRef names a destination (or destinations) for `agentcookie push`.
+// Via is an optional connector URI such as ssh://host. To contains one or
+// more destination URIs such as cdp://127.0.0.1:19222.
+type TargetRef struct {
+	Via string   `yaml:"via,omitempty" json:"via,omitempty"`
+	To  []string `yaml:"to" json:"to"`
+}
+
 // SinkConfig captures the sink machine's settings.
 //
 // SkipChromeSQLite is the v0.12.0-beta.3 headless-sink flag. When true,
@@ -189,6 +205,42 @@ func LoadSourceLocal(dir string) (*SourceConfig, error) {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+// LoadTargets reads targets.yaml from dir. A missing file is not an error:
+// callers that use explicit --to/--via flags do not need target config.
+func LoadTargets(dir string) (*TargetsFile, error) {
+	path := filepath.Join(dir, "targets.yaml")
+	cfg := &TargetsFile{Version: 1, Targets: map[string]TargetRef{}}
+	if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
+		return cfg, nil
+	}
+	if err := loadYAML(path, cfg); err != nil {
+		return nil, err
+	}
+	if cfg.Version == 0 {
+		cfg.Version = 1
+	}
+	if cfg.Version != 1 {
+		return nil, fmt.Errorf("%s: unsupported version %d", path, cfg.Version)
+	}
+	if cfg.Targets == nil {
+		cfg.Targets = map[string]TargetRef{}
+	}
+	for name, target := range cfg.Targets {
+		if strings.TrimSpace(name) == "" {
+			return nil, fmt.Errorf("%s: target name must not be empty", path)
+		}
+		if len(target.To) == 0 {
+			return nil, fmt.Errorf("%s: target %q must define at least one to destination", path, name)
+		}
+		for i, dest := range target.To {
+			if strings.TrimSpace(dest) == "" {
+				return nil, fmt.Errorf("%s: target %q to[%d] must not be empty", path, name, i)
+			}
+		}
+	}
+	return cfg, nil
 }
 
 // resolveSourcePaths applies the browser/Chrome-path/cmux-path resolution

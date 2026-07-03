@@ -382,6 +382,74 @@ security:
 	})
 }
 
+func TestLoadTargets(t *testing.T) {
+	t.Run("missing targets file returns empty config", func(t *testing.T) {
+		dir := t.TempDir()
+		cfg, err := LoadTargets(dir)
+		if err != nil {
+			t.Fatalf("LoadTargets missing: %v", err)
+		}
+		if cfg.Version != 1 {
+			t.Errorf("Version: got %d, want 1", cfg.Version)
+		}
+		if len(cfg.Targets) != 0 {
+			t.Errorf("expected no targets, got %+v", cfg.Targets)
+		}
+	})
+
+	t.Run("kernel browser target parses", func(t *testing.T) {
+		dir := t.TempDir()
+		writeFile(t, dir, "targets.yaml", `
+version: 1
+targets:
+  kernel-browser:
+    via: ssh://aircover1.ws
+    to:
+      - cdp://127.0.0.1:19222
+`)
+		cfg, err := LoadTargets(dir)
+		if err != nil {
+			t.Fatalf("LoadTargets: %v", err)
+		}
+		got := cfg.Targets["kernel-browser"]
+		if got.Via != "ssh://aircover1.ws" {
+			t.Errorf("Via: got %q", got.Via)
+		}
+		if len(got.To) != 1 || got.To[0] != "cdp://127.0.0.1:19222" {
+			t.Errorf("To: got %#v", got.To)
+		}
+	})
+
+	t.Run("unknown field is rejected", func(t *testing.T) {
+		dir := t.TempDir()
+		writeFile(t, dir, "targets.yaml", `
+version: 1
+targets:
+  kernel-browser:
+    via: ssh://aircover1.ws
+    bogus: nope
+    to:
+      - cdp://127.0.0.1:19222
+`)
+		if _, err := LoadTargets(dir); err == nil {
+			t.Fatal("expected error for unknown target field, got nil")
+		}
+	})
+
+	t.Run("empty target destination is rejected", func(t *testing.T) {
+		dir := t.TempDir()
+		writeFile(t, dir, "targets.yaml", `
+version: 1
+targets:
+  kernel-browser:
+    to: []
+`)
+		if _, err := LoadTargets(dir); err == nil {
+			t.Fatal("expected error for missing to destination, got nil")
+		}
+	})
+}
+
 func TestLoadSinkCmuxSurface(t *testing.T) {
 	t.Run("enabled cmux block round-trips with filter and tilde-expanded path", func(t *testing.T) {
 		dir := t.TempDir()
